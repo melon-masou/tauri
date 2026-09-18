@@ -52,7 +52,15 @@ use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
 #[cfg(windows)]
 use webview2_com::{ContainsFullScreenElementChangedEventHandler, FocusChangedEventHandler};
 #[cfg(windows)]
-use windows::Win32::Foundation::HWND;
+use windows::{
+  core::{IUnknown, Interface},
+  Win32::{
+    Foundation::HWND,
+    Graphics::DirectComposition::{
+      DCompositionCreateDevice2, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+    },
+  },
+};
 #[cfg(target_os = "ios")]
 use wry::WebViewBuilderExtIos;
 #[cfg(target_os = "macos")]
@@ -2607,7 +2615,41 @@ pub struct WindowWrapper {
   is_window_transparent: bool,
   #[cfg(windows)]
   surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+  #[cfg(windows)]
+  _composition_host: Option<CompositionHost>,
   focused_webview: Arc<Mutex<Option<String>>>,
+}
+
+/// Keeps the DirectComposition graph alive for a non-activating Tauri window.
+/// Wry owns the WebView2 composition controller, while the runtime owns the
+/// device, target and root visual attached to the Tao host HWND.
+#[cfg(windows)]
+struct CompositionHost {
+  device: IDCompositionDevice,
+  _target: IDCompositionTarget,
+  visual: IDCompositionVisual,
+}
+
+#[cfg(windows)]
+impl CompositionHost {
+  fn new(hwnd: isize) -> windows::core::Result<Self> {
+    unsafe {
+      let device: IDCompositionDevice = DCompositionCreateDevice2(None::<&IUnknown>)?;
+      let target = device.CreateTargetForHwnd(HWND(hwnd as _), true)?;
+      let visual = device.CreateVisual()?;
+      target.SetRoot(&visual)?;
+
+      Ok(Self {
+        device,
+        _target: target,
+        visual,
+      })
+    }
+  }
+
+  fn commit(&self) -> windows::core::Result<()> {
+    unsafe { self.device.Commit() }
+  }
 }
 
 impl WindowWrapper {
@@ -4125,6 +4167,8 @@ fn handle_user_message<T: UserEvent>(
             is_window_transparent,
             #[cfg(windows)]
             surface,
+            #[cfg(windows)]
+            _composition_host: None,
             focused_webview: Default::default(),
           },
         );
@@ -4520,6 +4564,8 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
   let background_color = window_builder.inner.window.background_color;
   #[cfg(windows)]
   let is_window_transparent = window_builder.inner.window.transparent;
+  #[cfg(windows)]
+  let use_composition_host = !window_builder.inner.window.focusable && webview.is_some();
 
   #[cfg(target_os = "macos")]
   {
@@ -4675,6 +4721,20 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
     handler(raw);
   }
 
+  #[cfg(windows)]
+  let composition_host = if use_composition_host {
+    let host =
+      CompositionHost::new(window.hwnd()).map_err(|error| Error::CreateWebview(Box::new(error)))?;
+    let visual = host
+      .visual
+      .cast::<IUnknown>()
+      .map_err(|error| Error::CreateWebview(Box::new(error)))?;
+    wry::register_composition_visual_target(window.hwnd(), visual);
+    Some(host)
+  } else {
+    None
+  };
+
   let mut webviews = Vec::new();
 
   let focused_webview = Arc::new(Mutex::new(None));
@@ -4692,6 +4752,13 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
       webview,
       focused_webview.clone(),
     )?);
+
+    #[cfg(windows)]
+    if let Some(host) = &composition_host {
+      host
+        .commit()
+        .map_err(|error| Error::CreateWebview(Box::new(error)))?;
+    }
   }
 
   let window = Arc::new(window);
@@ -4724,6 +4791,8 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
     is_window_transparent,
     #[cfg(windows)]
     surface,
+    #[cfg(windows)]
+    _composition_host: composition_host,
     focused_webview,
   })
 }
